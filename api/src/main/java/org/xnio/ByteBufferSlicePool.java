@@ -27,6 +27,7 @@ import java.util.HashSet;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import static org.xnio._private.Messages.msg;
 
@@ -41,6 +42,8 @@ import static org.xnio._private.Messages.msg;
 public final class ByteBufferSlicePool implements Pool<ByteBuffer> {
 
     private static final int LOCAL_LENGTH;
+    private static final boolean ENABLE_THREAD_SAFE_BUFFER = Boolean.getBoolean("xnio.bufferpool.threadsafe.enabled");
+    private static final boolean DEBUG_DOUBLE_FREE_BUFFER = Boolean.getBoolean("xnio.bufferpool.debug.doublefree");
 
     static {
         String value = AccessController.doPrivileged(new ReadPropertyAction("xnio.bufferpool.threadlocal.size", "12"));
@@ -181,9 +184,14 @@ public final class ByteBufferSlicePool implements Pool<ByteBuffer> {
         }
     }
 
+    private static final AtomicIntegerFieldUpdater<PooledByteBuffer> referenceCountUpdater = AtomicIntegerFieldUpdater.newUpdater(PooledByteBuffer.class, "referenceCount");
+
     private final class PooledByteBuffer implements Pooled<ByteBuffer> {
         private final Slice region;
         ByteBuffer buffer;
+
+        volatile int referenceCount = 1;
+        private volatile Throwable freePoint;
 
         PooledByteBuffer(final Slice region, final ByteBuffer buffer) {
             this.region = region;
@@ -203,8 +211,24 @@ public final class ByteBufferSlicePool implements Pool<ByteBuffer> {
             ByteBuffer buffer = this.buffer;
             this.buffer = null;
             if (buffer != null) {
-                // trust the user, repool the buffer
-                doFree(region);
+                if (ENABLE_THREAD_SAFE_BUFFER) {
+                    if (referenceCountUpdater.compareAndSet(this, 1, 0)) {
+                        if (DEBUG_DOUBLE_FREE_BUFFER) {
+                            freePoint = new Throwable("FREE POINT - freed thread name = (" + Thread.currentThread().getName() + ") / region (Slice) = " + region);
+                        }
+                        // repool the buffer
+                        doFree(region);
+                    } else {
+                        if (DEBUG_DOUBLE_FREE_BUFFER) {
+                            msg.warn("buffer already freed", new IllegalStateException("DOUBLE FREE BUFFER POINT - current thread name = (" + Thread.currentThread().getName() + ") / region (Slice) = " + region, freePoint));
+                        }
+                        // avoid double free buffer
+                        return;
+                    }
+                } else {
+                    // trust the user, repool the buffer
+                    doFree(region);
+                }
             }
         }
 
