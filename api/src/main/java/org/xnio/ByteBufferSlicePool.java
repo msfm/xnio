@@ -27,6 +27,7 @@ import java.util.HashSet;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import static org.xnio._private.Messages.msg;
 
@@ -181,9 +182,14 @@ public final class ByteBufferSlicePool implements Pool<ByteBuffer> {
         }
     }
 
+    private static final AtomicIntegerFieldUpdater<PooledByteBuffer> referenceCountUpdater = AtomicIntegerFieldUpdater.newUpdater(PooledByteBuffer.class, "referenceCount");
+
     private final class PooledByteBuffer implements Pooled<ByteBuffer> {
         private final Slice region;
         ByteBuffer buffer;
+
+        volatile int referenceCount = 1;
+        private volatile Throwable freePoint;
 
         PooledByteBuffer(final Slice region, final ByteBuffer buffer) {
             this.region = region;
@@ -203,8 +209,13 @@ public final class ByteBufferSlicePool implements Pool<ByteBuffer> {
             ByteBuffer buffer = this.buffer;
             this.buffer = null;
             if (buffer != null) {
-                // trust the user, repool the buffer
-                doFree(region);
+                if(referenceCountUpdater.compareAndSet(this, 1, 0)) {
+                    freePoint = new Throwable("### FREE POINT - freed thread name = (" + Thread.currentThread().getName() + ") / region (Slice) = " + region + " / buffer = " + buffer);
+                    // trust the user, repool the buffer
+                    doFree(region);
+                } else {
+                    new Throwable("### BUFFER ALREADY FREED - current thread name = (" + Thread.currentThread().getName() + ") / region (Slice) = " + region + " / buffer = " + buffer, freePoint).printStackTrace();
+                }
             }
         }
 
