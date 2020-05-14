@@ -157,6 +157,11 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
                 .build()
             );
         }
+
+        if (builder.isPrestartAllCoreWorkerPool()) {
+            log.debugf("prestart the task worker thread pool [%s] with core-pool-size [%s]", taskPool, taskPool.getCorePoolSize());
+            taskPool.prestartAllCoreThreads();
+        }
     }
 
     //==================================================
@@ -1032,6 +1037,7 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
         private String workerName;
         private int coreWorkerPoolSize = 4;
         private int maxWorkerPoolSize = 16;
+        private boolean prestartAllCoreWorkerPool;
         private ThreadGroup threadGroup;
         private boolean daemon;
         private int workerKeepAlive = 60_000;
@@ -1064,6 +1070,7 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
                 setWorkerIoThreads(max(optionMap.get(Options.WORKER_READ_THREADS, 1), optionMap.get(Options.WORKER_WRITE_THREADS, 1)));
             }
             setWorkerStackSize(optionMap.get(Options.STACK_SIZE, workerStackSize));
+            setPrestartAllCoreWorkerPool(optionMap.get(Options.WORKER_TASK_PRESTART_ALL_CORE_THREADS, prestartAllCoreWorkerPool));
             return this;
         }
 
@@ -1127,6 +1134,15 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
         public Builder setMaxWorkerPoolSize(final int maxWorkerPoolSize) {
             Assert.checkMinimumParameter("maxWorkerPoolSize", 0, maxWorkerPoolSize);
             this.maxWorkerPoolSize = maxWorkerPoolSize;
+            return this;
+        }
+
+        public boolean isPrestartAllCoreWorkerPool() {
+            return prestartAllCoreWorkerPool;
+        }
+
+        public Builder setPrestartAllCoreWorkerPool(final boolean prestartAllCoreWorkerPool) {
+            this.prestartAllCoreWorkerPool = prestartAllCoreWorkerPool;
             return this;
         }
 
@@ -1309,6 +1325,8 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
         int getPoolSize();
 
         int getQueueSize();
+
+        int prestartAllCoreThreads();
     }
 
     static class DefaultThreadPoolExecutor extends ThreadPoolExecutor {
@@ -1404,6 +1422,11 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
         public int getQueueSize() {
             return delegate.getQueue().size();
         }
+
+        @Override
+        public int prestartAllCoreThreads() {
+            return delegate.prestartAllCoreThreads();
+        }
     }
 
     static class EnhancedQueueExecutorTaskPool implements TaskPool {
@@ -1460,6 +1483,10 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
         public int getQueueSize() {
             return executor.getQueueSize();
         }
+
+        public int prestartAllCoreThreads() {
+            return executor.prestartAllCoreThreads();
+        }
     }
 
     static class ExecutorServiceTaskPool implements TaskPool {
@@ -1511,6 +1538,10 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
         }
 
         public int getQueueSize() {
+            return -1;
+        }
+
+        public int prestartAllCoreThreads() {
             return -1;
         }
     }
@@ -1580,6 +1611,11 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
         @Override
         public int getQueueSize() {
             return delegate.getQueueSize();
+        }
+
+        @Override
+        public int prestartAllCoreThreads() {
+            return delegate.prestartAllCoreThreads();
         }
     }
 }

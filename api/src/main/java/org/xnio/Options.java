@@ -525,6 +525,11 @@ public final class Options {
     public static final Option<Integer> WORKER_TASK_LIMIT = Option.simple(Options.class, "WORKER_TASK_LIMIT", Integer.class);
 
     /**
+     * Specify whether all "core" threads of the worker task thread pool should be prestarted. Defaults to {@code false}.
+     */
+    public static final Option<Boolean>  WORKER_PRESTART_ALL_TASK_CORE_THREADS = Option.simple(Options.class, "WORKER_PRESTART_ALL_TASK_CORE_THREADS", Boolean.class);
+
+    /**
      * Specify that output should be buffered.  The exact behavior of the buffering is not specified; it may flush based
      * on buffered size or time.  An explicit {@link SuspendableWriteChannel#flush()} will still cause
      * the channel to flush its contents immediately.
