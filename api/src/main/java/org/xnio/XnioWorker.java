@@ -24,6 +24,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.security.PrivilegedAction;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
@@ -96,6 +97,15 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
 
     private static final RuntimePermission CREATE_WORKER_PERMISSION = new RuntimePermission("createXnioWorker");
 
+    private static final RuntimePermission MODIFY_THREAD_PERMISSION = new RuntimePermission("modifyThread");
+
+    private static final boolean ENABLE_CLEANABLE_WORKER_THREAD_FACTORY = Boolean.parseBoolean(doPrivileged(new ReadPropertyAction("xnio.cleanable-task-worker-threadfactory", "true")));
+
+    // A flag to check if the current thread can register a cleanup Runnable task on the thread exits.
+    private static final ThreadLocal<Boolean> CLEANABLE_THREAD = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    // this holds registered cleanup Runnaable tasks for each task worker thread
+    private static final ThreadLocal<List<Runnable>> CLEANUP_RUNNABLE_LIST_THREAD_LOCAL = new ThreadLocal<>();
+
     private int getNextSeq() {
         return taskSeqUpdater.incrementAndGet(this);
     }
@@ -146,11 +156,14 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
                 new WorkerThreadFactory(builder.getThreadGroup(), builder.getWorkerStackSize(), markThreadAsDaemon),
                 terminationTask));
         } else {
+            final ThreadFactory threadFactory = ENABLE_CLEANABLE_WORKER_THREAD_FACTORY
+                    ? new CleanableWorkerThreadFactory(builder.getThreadGroup(), builder.getWorkerStackSize(), markThreadAsDaemon)
+                    : new WorkerThreadFactory(builder.getThreadGroup(), builder.getWorkerStackSize(), markThreadAsDaemon);
             taskPool = new EnhancedQueueExecutorTaskPool(new EnhancedQueueExecutor.Builder()
                 .setCorePoolSize(builder.getCoreWorkerPoolSize())
                 .setMaximumPoolSize(builder.getMaxWorkerPoolSize())
                 .setKeepAliveTime(builder.getWorkerKeepAlive(), TimeUnit.MILLISECONDS)
-                .setThreadFactory(new WorkerThreadFactory(builder.getThreadGroup(), builder.getWorkerStackSize(), markThreadAsDaemon))
+                .setThreadFactory(threadFactory)
                 .setTerminationTask(terminationTask)
                 .setRegisterMBean(true)
                 .setMBeanName(workerName)
@@ -1192,6 +1205,72 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
         }
     }
 
+
+    //==================================================
+    //
+    // Utility method
+    //
+    //==================================================
+
+    /**
+     * Register a runnable task (cleanup task) to be executed when the current thread exits.
+     * As a cleanup task can be executed only for task worker thread created through CleanableWorkerThreadFactory,
+     * a task is not registered and return false if the current thread is not created through CleanableWorkerThreadFactory.
+     *
+     * @param task the task to run
+     * @return {@code true} if the task was registered; {@code false} if the task is {@code null} or if the current
+     * thread is an instance of {@code XnioIoThread}
+     * @throws SecurityException if a security manager is installed and the caller's security context lacks the
+     *                           {@code modifyThread} {@link RuntimePermission}
+     */
+    public static boolean addTaskOnThreadExit(Runnable task) throws SecurityException {
+        final SecurityManager sm = System.getSecurityManager();
+        if (sm != null) {
+            sm.checkPermission(MODIFY_THREAD_PERMISSION);
+        }
+        if (task == null) {
+            return false;
+        }
+        final Thread currentThread = Thread.currentThread();
+        if (!isTaskOnThreadExitSuported()) {
+            msg.debugf("This cleanup task [%s] can not been registered for Thread [%s] because a cleanup task" +
+                    " can be executed only for task worker thread created by CleanableWorkerThreadFactory.", task, currentThread.getName());
+            return false;
+        }
+        List<Runnable> cleanupTasks = CLEANUP_RUNNABLE_LIST_THREAD_LOCAL.get();
+        if (cleanupTasks == null) {
+            cleanupTasks = new ArrayList<>();
+        }
+        final ClassLoader tccl = getContextClassLoader();
+        cleanupTasks.add(new Runnable() {
+            @Override
+            public void run() {
+                final ClassLoader loader = getContextClassLoader();
+                try {
+                    setContextClassLoader(tccl);
+                    msg.debugf("Executing a cleanup task [%s] for Thread [%s] on the class loader [%s]", task, currentThread.getName(), tccl);
+                    task.run();
+                } finally {
+                    setContextClassLoader(loader);
+                }
+            }
+        });
+        CLEANUP_RUNNABLE_LIST_THREAD_LOCAL.set(cleanupTasks);
+        msg.debugf("A cleanup runnable task [%s] has been registered to Thread [%s]", task, currentThread.getName());
+        return true;
+    }
+
+    /**
+     * Check if the current thread supports executing a cleanup task on the thread exits.
+     * As a cleanup task can be executed only for task worker thread created through CleanableWorkerThreadFactory,
+     * this returns {@code true} only if the current thread has been created through CleanableWorkerThreadFactory.
+     *
+     * @return {@code true} if the current thread supports executing a cleanup task on the thread exits; {@code false} if not.
+     */
+    public static boolean isTaskOnThreadExitSuported() {
+        return CLEANABLE_THREAD.get();
+    }
+
     //==================================================
     //
     // Private
@@ -1279,6 +1358,81 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
                         taskThread.setDaemon(true);
                     }
                     return taskThread;
+                }
+            });
+        }
+    }
+
+    class CleanableWorkerThreadFactory implements ThreadFactory {
+
+        private final ThreadGroup threadGroup;
+        private final long stackSize;
+        private final boolean markThreadAsDaemon;
+
+        CleanableWorkerThreadFactory(final ThreadGroup threadGroup, final long stackSize, final boolean markThreadAsDaemon) {
+            this.threadGroup = threadGroup;
+            this.stackSize = stackSize;
+            this.markThreadAsDaemon = markThreadAsDaemon;
+        }
+
+        public Thread newThread(final Runnable r) {
+            return doPrivileged(new PrivilegedAction<Thread>() {
+                public Thread run() {
+                    final Thread taskThread = new Thread(threadGroup, new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                CLEANABLE_THREAD.set(Boolean.TRUE);
+                                r.run();
+                            } finally {
+                                // run cleanup runnable tasks when the thread exits
+                                final List<Runnable> cleanupTasks = CLEANUP_RUNNABLE_LIST_THREAD_LOCAL.get();
+                                if (cleanupTasks != null) {
+                                    final Thread currentThread = Thread.currentThread();
+                                    msg.debugf("Thread [%s] exiting and executing %d cleanup tasks", currentThread.getName(), cleanupTasks.size());
+                                    for (Runnable task : cleanupTasks) {
+                                        try {
+                                            task.run();
+                                        } catch (Throwable t) {
+                                            msg.debugf(t, "Exception or Error occurred during executing a cleanup task for Thread [%s]", currentThread.getName());
+                                        }
+                                    }
+                                    CLEANUP_RUNNABLE_LIST_THREAD_LOCAL.remove();
+                                }
+                                CLEANABLE_THREAD.remove();
+                            }
+                        }
+                    }, name + " task-" + getNextSeq(), stackSize);
+                    // Mark the thread as daemon if the Options.THREAD_DAEMON has been set
+                    if (markThreadAsDaemon) {
+                        taskThread.setDaemon(true);
+                    }
+                    return taskThread;
+                }
+            });
+        }
+    }
+
+    private static ClassLoader getContextClassLoader() {
+        if (System.getSecurityManager() == null) {
+            return Thread.currentThread().getContextClassLoader();
+        } else {
+            return doPrivileged(new PrivilegedAction<ClassLoader>() {
+                public ClassLoader run() {
+                    return Thread.currentThread().getContextClassLoader();
+                }
+            });
+        }
+    }
+
+    private static void setContextClassLoader(final ClassLoader classLoader) {
+        if (System.getSecurityManager() == null) {
+            Thread.currentThread().setContextClassLoader(classLoader);
+        } else {
+            doPrivileged(new PrivilegedAction<Object>() {
+                public Object run() {
+                    Thread.currentThread().setContextClassLoader(classLoader);
+                    return null;
                 }
             });
         }
