@@ -263,6 +263,17 @@ final class NioXnio extends Xnio {
         if (holder == null) {
             holder = new FinalizableSelectorHolder(tempSelectorCreator.open());
             threadLocal.set(holder);
+            if (XnioWorker.isTaskOnThreadExitSuported()) {
+                if (System.getSecurityManager() == null) {
+                    XnioWorker.addTaskOnThreadExit(() -> threadLocal.remove());
+                } else {
+                    AccessController.doPrivileged(new PrivilegedAction<Boolean>() {
+                        public Boolean run() {
+                            return XnioWorker.addTaskOnThreadExit(() -> threadLocal.remove());
+                        }
+                    });
+                }
+            }
         }
         return holder.selector;
     }
