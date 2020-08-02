@@ -33,6 +33,7 @@ import org.xnio.Options;
 import org.xnio.ReadPropertyAction;
 import org.xnio.Xnio;
 import org.xnio.OptionMap;
+import org.xnio.XnioSelectorHolder;
 import org.xnio.XnioWorker;
 import org.xnio.management.XnioProviderMXBean;
 import org.xnio.management.XnioServerMXBean;
@@ -246,25 +247,13 @@ final class NioXnio extends Xnio {
         return super.createFileSystemWatcher(name, options);
     }
 
-    private final ThreadLocal<FinalizableSelectorHolder> selectorThreadLocal = new ThreadLocal<FinalizableSelectorHolder>() {
-        public void remove() {
-            // if no selector was created, none will be closed
-            FinalizableSelectorHolder holder = get();
-            if(holder != null) {
-                IoUtils.safeClose(holder.selector);
-            }
-            super.remove();
-        }
-    };
-
     Selector getSelector() throws IOException {
-        final ThreadLocal<FinalizableSelectorHolder> threadLocal = selectorThreadLocal;
-        FinalizableSelectorHolder holder = threadLocal.get();
-        if (holder == null) {
-            holder = new FinalizableSelectorHolder(tempSelectorCreator.open());
-            threadLocal.set(holder);
+        Selector selector = XnioSelectorHolder.get();
+        if (selector == null) {
+            selector = tempSelectorCreator.open();
+            XnioSelectorHolder.set(selector);
         }
-        return holder.selector;
+        return selector;
     }
 
     private static class DefaultSelectorCreator implements SelectorCreator {
@@ -327,17 +316,4 @@ final class NioXnio extends Xnio {
         return Xnio.register(serverMXBean);
     }
 
-    private static final class FinalizableSelectorHolder {
-        final Selector selector;
-
-
-        private FinalizableSelectorHolder(Selector selector) {
-            this.selector = selector;
-        }
-
-        @Override
-        protected void finalize() throws Throwable {
-            IoUtils.safeClose(selector);
-        }
-    }
 }
