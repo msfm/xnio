@@ -96,6 +96,8 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
 
     private static final RuntimePermission CREATE_WORKER_PERMISSION = new RuntimePermission("createXnioWorker");
 
+    private static final boolean ENABLE_CLEANABLE_WORKER_THREAD_FACTORY = Boolean.parseBoolean(doPrivileged(new ReadPropertyAction("xnio.cleanable-task-worker-threadfactory", "true")));
+
     private int getNextSeq() {
         return taskSeqUpdater.incrementAndGet(this);
     }
@@ -146,11 +148,14 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
                 new WorkerThreadFactory(builder.getThreadGroup(), builder.getWorkerStackSize(), markThreadAsDaemon),
                 terminationTask));
         } else {
+            final ThreadFactory threadFactory = ENABLE_CLEANABLE_WORKER_THREAD_FACTORY
+                    ? new CleanableWorkerThreadFactory(builder.getThreadGroup(), builder.getWorkerStackSize(), markThreadAsDaemon)
+                    : new WorkerThreadFactory(builder.getThreadGroup(), builder.getWorkerStackSize(), markThreadAsDaemon);
             taskPool = new EnhancedQueueExecutorTaskPool(new EnhancedQueueExecutor.Builder()
                 .setCorePoolSize(builder.getCoreWorkerPoolSize())
                 .setMaximumPoolSize(builder.getMaxWorkerPoolSize())
                 .setKeepAliveTime(builder.getWorkerKeepAlive(), TimeUnit.MILLISECONDS)
-                .setThreadFactory(new WorkerThreadFactory(builder.getThreadGroup(), builder.getWorkerStackSize(), markThreadAsDaemon))
+                .setThreadFactory(threadFactory)
                 .setTerminationTask(terminationTask)
                 .setRegisterMBean(true)
                 .setMBeanName(workerName)
@@ -1274,6 +1279,42 @@ public abstract class XnioWorker extends AbstractExecutorService implements Conf
             return doPrivileged(new PrivilegedAction<Thread>() {
                 public Thread run() {
                     final Thread taskThread = new Thread(threadGroup, r, name + " task-" + getNextSeq(), stackSize);
+                    // Mark the thread as daemon if the Options.THREAD_DAEMON has been set
+                    if (markThreadAsDaemon) {
+                        taskThread.setDaemon(true);
+                    }
+                    return taskThread;
+                }
+            });
+        }
+    }
+
+    class CleanableWorkerThreadFactory implements ThreadFactory {
+
+        private final ThreadGroup threadGroup;
+        private final long stackSize;
+        private final boolean markThreadAsDaemon;
+
+        CleanableWorkerThreadFactory(final ThreadGroup threadGroup, final long stackSize, final boolean markThreadAsDaemon) {
+            this.threadGroup = threadGroup;
+            this.stackSize = stackSize;
+            this.markThreadAsDaemon = markThreadAsDaemon;
+        }
+
+        public Thread newThread(final Runnable r) {
+            return doPrivileged(new PrivilegedAction<Thread>() {
+                public Thread run() {
+                    final Thread taskThread = new Thread(threadGroup, new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                r.run();
+                            } finally {
+                                msg.tracef("Thread [%s] exiting and executing cleanup tasks", Thread.currentThread().getName());
+                                xnio.handleThreadExit();
+                            }
+                        }
+                    }, name + " task-" + getNextSeq(), stackSize);
                     // Mark the thread as daemon if the Options.THREAD_DAEMON has been set
                     if (markThreadAsDaemon) {
                         taskThread.setDaemon(true);
